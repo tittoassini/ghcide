@@ -6,6 +6,7 @@
 module Development.IDE.Spans.Common (
   showGhc
 , showName
+, showNameWithoutUniques
 , safeTyThingId
 , safeTyThingType
 , SpanDoc(..)
@@ -20,7 +21,6 @@ module Development.IDE.Spans.Common (
 import Data.Maybe
 import qualified Data.Text as T
 import Data.List.Extra
-import Data.Map (Map)
 import Control.DeepSeq
 import GHC.Generics
 
@@ -30,13 +30,14 @@ import DynFlags
 import ConLike
 import DataCon
 import Var
+import NameEnv
 
 import qualified Documentation.Haddock.Parser as H
 import qualified Documentation.Haddock.Types as H
 import Development.IDE.GHC.Orphans ()
 
-type DocMap = Map Name SpanDoc
-type KindMap = Map Name Type
+type DocMap = NameEnv SpanDoc
+type KindMap = NameEnv TyThing
 
 showGhc :: Outputable a => a -> String
 showGhc = showPpr unsafeGlobalDynFlags
@@ -46,6 +47,13 @@ showName = T.pack . prettyprint
   where
     prettyprint x = renderWithStyle unsafeGlobalDynFlags (ppr x) style
     style = mkUserStyle unsafeGlobalDynFlags neverQualify AllTheWay
+
+showNameWithoutUniques :: Outputable a => a -> T.Text
+showNameWithoutUniques = T.pack . prettyprint
+  where
+    dyn = unsafeGlobalDynFlags `gopt_set` Opt_SuppressUniques
+    prettyprint x = renderWithStyle dyn (ppr x) style
+    style = mkUserStyle dyn neverQualify AllTheWay
 
 -- From haskell-ide-engine/src/Haskell/Ide/Engine/Support/HieExtras.hs
 safeTyThingType :: TyThing -> Maybe Type

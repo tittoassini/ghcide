@@ -118,9 +118,12 @@ loadSession dir = do
         -- files in the project so that `knownFiles` can learn about them and
         -- we can generate a complete module graph
     let extendKnownTargets newTargets = do
-          knownTargets <- forM newTargets $ \TargetDetails{..} -> do
-            found <- filterM (IO.doesFileExist . fromNormalizedFilePath) targetLocations
-            return (targetTarget, found)
+          knownTargets <- forM newTargets $ \TargetDetails{..} ->
+            case targetTarget of
+              TargetFile f -> pure (targetTarget, [f])
+              TargetModule _ -> do
+                found <- filterM (IO.doesFileExist . fromNormalizedFilePath) targetLocations
+                return (targetTarget, found)
           modifyVar_ knownTargetsVar $ traverseHashed $ \known -> do
             let known' = HM.unionWith (<>) known $ HM.fromList knownTargets
             when (known /= known') $
@@ -368,7 +371,7 @@ emptyHscEnv :: IORef NameCache -> FilePath -> IO HscEnv
 emptyHscEnv nc libDir = do
     env <- runGhc (Just libDir) getSession
     initDynLinker env
-    pure $ setNameCache nc env
+    pure $ setNameCache nc env{ hsc_dflags = (hsc_dflags env){useUnicode = True } }
 
 data TargetDetails = TargetDetails
   {
@@ -501,6 +504,7 @@ setCacheDir logger prefix hscComponents comps dflags = do
     pure $ dflags
           & setHiDir cacheDir
           & setHieDir cacheDir
+          & setODir cacheDir
 
 
 renderCradleError :: NormalizedFilePath -> CradleError -> FileDiagnostic
@@ -657,6 +661,11 @@ setHiDir f d =
     -- override user settings to avoid conflicts leading to recompilation
     d { hiDir      = Just f}
 
+setODir :: FilePath -> DynFlags -> DynFlags
+setODir f d =
+    -- override user settings to avoid conflicts leading to recompilation
+    d { objectDir = Just f}
+
 getCacheDir :: String -> [String] -> IO FilePath
 getCacheDir prefix opts = getXdgDirectory XdgCache (cacheDir </> prefix ++ "-" ++ opts_hash)
     where
@@ -671,10 +680,11 @@ cacheDir = "ghcide"
 notifyUserImplicitCradle:: FilePath -> FromServerMessage
 notifyUserImplicitCradle fp =
     NotShowMessage $
-    NotificationMessage "2.0" WindowShowMessage $ ShowMessageParams MtWarning $
+    NotificationMessage "2.0" WindowShowMessage $ ShowMessageParams MtInfo $
       "No [cradle](https://github.com/mpickering/hie-bios#hie-bios) found for "
       <> T.pack fp <>
-      ".\n Proceeding with [implicit cradle](https://hackage.haskell.org/package/implicit-hie)"
+      ".\n Proceeding with [implicit cradle](https://hackage.haskell.org/package/implicit-hie).\n\
+      \You should ignore this message, unless you see a 'Multi Cradle: No prefixes matched' error."
 
 notifyCradleLoaded :: FilePath -> FromServerMessage
 notifyCradleLoaded fp =

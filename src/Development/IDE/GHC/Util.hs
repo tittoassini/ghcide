@@ -10,7 +10,6 @@ module Development.IDE.GHC.Util(
     envImportPaths,
     modifyDynFlags,
     evalGhcEnv,
-    runGhcEnv,
     deps,
     -- * GHC wrappers
     prettyPrint,
@@ -31,7 +30,8 @@ module Development.IDE.GHC.Util(
     setHieDir,
     dontWriteHieFiles,
     disableWarningsAsErrors,
-    newHscEnvEqPreserveImportPaths) where
+    newHscEnvEqPreserveImportPaths,
+    newHscEnvEqWithImportPaths) where
 
 import Control.Concurrent
 import Data.List.Extra
@@ -75,6 +75,7 @@ import RdrName (nameRdrName, rdrNameOcc)
 
 import Development.IDE.GHC.Compat as GHC
 import Development.IDE.Types.Location
+import System.Directory (canonicalizePath)
 
 
 ----------------------------------------------------------------------
@@ -188,9 +189,19 @@ data HscEnvEq = HscEnvEq
 newHscEnvEq :: FilePath -> HscEnv -> [(InstalledUnitId, DynFlags)] -> IO HscEnvEq
 newHscEnvEq cradlePath hscEnv0 deps = do
     envUnique <- newUnique
-    let envImportPaths = Just $ relativeToCradle <$> importPaths (hsc_dflags hscEnv0)
-        relativeToCradle = (takeDirectory cradlePath </>)
+    let relativeToCradle = (takeDirectory cradlePath </>)
         hscEnv = removeImportPaths hscEnv0
+
+    -- Canonicalize import paths since we also canonicalize targets
+    importPathsCanon <-
+      mapM canonicalizePath $ relativeToCradle <$> importPaths (hsc_dflags hscEnv0)
+    let envImportPaths = Just importPathsCanon
+
+    return HscEnvEq{..}
+
+newHscEnvEqWithImportPaths :: Maybe [String] -> HscEnv -> [(InstalledUnitId, DynFlags)] -> IO HscEnvEq
+newHscEnvEqWithImportPaths envImportPaths hscEnv deps = do
+    envUnique <- newUnique
     return HscEnvEq{..}
 
 -- | Wrap an 'HscEnv' into an 'HscEnvEq'.

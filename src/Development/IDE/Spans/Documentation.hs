@@ -15,6 +15,7 @@ module Development.IDE.Spans.Documentation (
 
 import           Control.Monad
 import           Control.Monad.Extra (findM)
+import           Data.Either
 import           Data.Foldable
 import           Data.List.Extra
 import qualified Data.Map as M
@@ -35,46 +36,49 @@ import           GhcMonad
 import           Packages
 import           Name
 import           Language.Haskell.LSP.Types (getUri, filePathToUri)
-import Data.Either
+import           TcRnTypes
+import           ExtractDocs
+import           NameEnv
+import HscTypes (HscEnv(hsc_dflags))
 
 mkDocMap
-  :: GhcMonad m
-  => [ParsedModule]
+  :: HscEnv
+  -> [ParsedModule]
   -> RefMap
-  -> ModIface
-  -> [ModIface]
-  -> m DocAndKindMap
-mkDocMap sources rm hmi deps =
-  do mapM_ (`loadDepModule` Nothing) (reverse deps)
-     loadDepModule hmi Nothing
-     d <- foldrM getDocs M.empty names
-     k <- foldrM getType M.empty names
+  -> TcGblEnv
+  -> IO DocAndKindMap
+mkDocMap env sources rm this_mod =
+  do let (_ , DeclDocMap this_docs, _) = extractDocs this_mod
+     d <- foldrM getDocs (mkNameEnv $ M.toList $ fmap (`SpanDocString` SpanDocUris Nothing Nothing) this_docs) names
+     k <- foldrM getType (tcg_type_env this_mod) names
      pure $ DKMap d k
   where
-    getDocs n map = do
-      doc <- getDocumentationTryGhc mod sources n
-      pure $ M.insert n doc map
+    getDocs n map
+      | maybe True (mod ==) $ nameModule_maybe n = pure map -- we already have the docs in this_docs, or they do not exist
+      | otherwise = do
+      doc <- getDocumentationTryGhc env mod sources n
+      pure $ extendNameEnv map n doc
     getType n map
       | isTcOcc $ occName n = do
-        kind <- lookupKind mod n
-        pure $ maybe id (M.insert n) kind map
+        kind <- lookupKind env mod n
+        pure $ maybe map (extendNameEnv map n) kind
       | otherwise = pure map
     names = rights $ S.toList idents
     idents = M.keysSet rm
-    mod = mi_module hmi
+    mod = tcg_mod this_mod
 
-lookupKind :: GhcMonad m => Module -> Name -> m (Maybe Type)
-lookupKind mod =
-    fmap (either (const Nothing) (safeTyThingType =<<)) . catchSrcErrors "span" . lookupName mod
+lookupKind :: HscEnv -> Module -> Name -> IO (Maybe TyThing)
+lookupKind env mod =
+    fmap (either (const Nothing) id) . catchSrcErrors (hsc_dflags env) "span" . lookupName env mod
 
-getDocumentationTryGhc :: GhcMonad m => Module -> [ParsedModule] -> Name -> m SpanDoc
-getDocumentationTryGhc mod deps n = head <$> getDocumentationsTryGhc mod deps [n]
+getDocumentationTryGhc :: HscEnv -> Module -> [ParsedModule] -> Name -> IO SpanDoc
+getDocumentationTryGhc env mod deps n = head <$> getDocumentationsTryGhc env mod deps [n]
 
-getDocumentationsTryGhc :: GhcMonad m => Module -> [ParsedModule] -> [Name] -> m [SpanDoc]
+getDocumentationsTryGhc :: HscEnv -> Module -> [ParsedModule] -> [Name] -> IO [SpanDoc]
 -- Interfaces are only generated for GHC >= 8.6.
 -- In older versions, interface files do not embed Haddocks anyway
-getDocumentationsTryGhc mod sources names = do
-  res <- catchSrcErrors "docs" $ getDocsBatch mod names
+getDocumentationsTryGhc env mod sources names = do
+  res <- catchSrcErrors (hsc_dflags env) "docs" $ getDocsBatch env mod names
   case res of
       Left _ -> mapM mkSpanDocText names
       Right res -> zipWithM unwrap res names
@@ -87,7 +91,7 @@ getDocumentationsTryGhc mod sources names = do
    
     -- Get the uris to the documentation and source html pages if they exist
     getUris name = do
-      df <- getSessionDynFlags
+      let df = hsc_dflags env
       (docFu, srcFu) <-
         case nameModule_maybe name of
           Just mod -> liftIO $ do

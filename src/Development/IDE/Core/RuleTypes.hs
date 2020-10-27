@@ -2,7 +2,8 @@
 -- SPDX-License-Identifier: Apache-2.0
 
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DerivingStrategies #-}
 
 -- | A Shake implementation of the compiler service, built
 --   using the "Shaker" abstraction layer for in-memory use.
@@ -26,13 +27,18 @@ import           Development.Shake
 import           GHC.Generics                             (Generic)
 
 import Module (InstalledUnitId)
-import HscTypes (hm_iface, CgGuts, Linkable, HomeModInfo, ModDetails)
+import HscTypes (ModGuts, hm_iface, HomeModInfo, hm_linkable)
 
 import           Development.IDE.Spans.Common
 import           Development.IDE.Spans.LocalBindings
 import           Development.IDE.Import.FindImports (ArtifactsLocation)
 import Data.ByteString (ByteString)
 import Language.Haskell.LSP.Types (NormalizedFilePath)
+import TcRnMonad (TcGblEnv)
+import qualified Data.ByteString.Char8 as BS
+
+data LinkableType = ObjectLinkable | BCOLinkable
+  deriving (Eq,Ord,Show)
 
 -- NOTATION
 --   Foo+ means Foo for the dependencies
@@ -59,41 +65,62 @@ instance NFData   GetKnownTargets
 instance Binary   GetKnownTargets
 type instance RuleResult GetKnownTargets = KnownTargets
 
+-- | Convert to Core, requires TypeCheck*
+type instance RuleResult GenerateCore = ModGuts
+
+data GenerateCore = GenerateCore
+    deriving (Eq, Show, Typeable, Generic)
+instance Hashable GenerateCore
+instance NFData   GenerateCore
+instance Binary   GenerateCore
+
+data GetImportMap = GetImportMap
+    deriving (Eq, Show, Typeable, Generic)
+instance Hashable GetImportMap
+instance NFData   GetImportMap
+instance Binary   GetImportMap
+
+type instance RuleResult GetImportMap = ImportMap
+newtype ImportMap = ImportMap
+  { importMap :: M.Map ModuleName NormalizedFilePath -- ^ Where are the modules imported by this file located?
+  } deriving stock Show
+    deriving newtype NFData
+
 -- | Contains the typechecked module and the OrigNameCache entry for
 -- that module.
 data TcModuleResult = TcModuleResult
-    { tmrModule     :: TypecheckedModule
-    -- ^ warning, the ModIface in the tm_checked_module_info of the
-    -- TypecheckedModule will always be Nothing, use the ModIface in the
-    -- HomeModInfo instead
-    , tmrModInfo    :: HomeModInfo
+    { tmrParsed :: ParsedModule
+    , tmrRenamed :: RenamedSource
+    , tmrTypechecked :: TcGblEnv
     , tmrDeferedError :: !Bool -- ^ Did we defer any type errors for this module?
-    , tmrHieAsts :: !(Maybe (HieASTs Type)) -- ^ The HieASTs if we computed them
     }
 instance Show TcModuleResult where
-    show = show . pm_mod_summary . tm_parsed_module . tmrModule
+    show = show . pm_mod_summary . tmrParsed
 
 instance NFData TcModuleResult where
     rnf = rwhnf
 
 tmrModSummary :: TcModuleResult -> ModSummary
-tmrModSummary = pm_mod_summary . tm_parsed_module . tmrModule
+tmrModSummary = pm_mod_summary . tmrParsed
 
 data HiFileResult = HiFileResult
     { hirModSummary :: !ModSummary
     -- Bang patterns here are important to stop the result retaining
     -- a reference to a typechecked module
-    , hirModIface :: !ModIface
+    , hirHomeMod :: !HomeModInfo
+    -- ^ Includes the Linkable iff we need object files
     }
 
-tmr_hiFileResult :: TcModuleResult -> HiFileResult
-tmr_hiFileResult tmr = HiFileResult modSummary modIface
-  where
-    modIface = hm_iface . tmrModInfo $ tmr
-    modSummary = tmrModSummary tmr
-
 hiFileFingerPrint :: HiFileResult -> ByteString
-hiFileFingerPrint = fingerprintToBS . getModuleHash . hirModIface
+hiFileFingerPrint hfr = ifaceBS <> linkableBS
+  where
+    ifaceBS = fingerprintToBS . getModuleHash . hirModIface $ hfr -- will always be two bytes
+    linkableBS = case hm_linkable $ hirHomeMod hfr of
+      Nothing -> ""
+      Just l -> BS.pack $ show $ linkableTime l
+
+hirModIface :: HiFileResult -> ModIface
+hirModIface = hm_iface . hirHomeMod
 
 instance NFData HiFileResult where
     rnf = rwhnf
@@ -106,12 +133,14 @@ data HieAstResult
   = HAR
   { hieModule :: Module
   , hieAst :: !(HieASTs Type)
-  , refMap :: !RefMap
-  , importMap :: !(M.Map ModuleName NormalizedFilePath) -- ^ Where are the modules imported by this file located?
+  , refMap :: RefMap
+  -- ^ Lazy because its value only depends on the hieAst, which is bundled in this type
+  -- Lazyness can't cause leaks here because the lifetime of `refMap` will be the same
+  -- as that of `hieAst`
   }
  
 instance NFData HieAstResult where
-    rnf (HAR m hf rm im) = rnf m `seq` rwhnf hf `seq` rnf rm `seq` rnf im
+    rnf (HAR m hf _rm) = rnf m `seq` rwhnf hf
  
 instance Show HieAstResult where
     show = show . hieModule
@@ -127,18 +156,12 @@ type instance RuleResult GetBindings = Bindings
 
 data DocAndKindMap = DKMap {getDocMap :: !DocMap, getKindMap :: !KindMap}
 instance NFData DocAndKindMap where
-    rnf (DKMap a b) = rnf a `seq` rnf b
+    rnf (DKMap a b) = rwhnf a `seq` rwhnf b
 
 instance Show DocAndKindMap where
     show = const "docmap"
 
 type instance RuleResult GetDocMap = DocAndKindMap
-
--- | Convert to Core, requires TypeCheck*
-type instance RuleResult GenerateCore = (SafeHaskellMode, CgGuts, ModDetails)
-
--- | Generate byte code for template haskell.
-type instance RuleResult GenerateByteCode = Linkable
 
 -- | A GHC session that we reuse.
 type instance RuleResult GhcSession = HscEnvEq
@@ -162,6 +185,10 @@ type instance RuleResult GetModIfaceFromDisk = HiFileResult
 -- | Get a module interface details, either from an interface file or a typechecked module
 type instance RuleResult GetModIface = HiFileResult
 
+-- | Get a module interface details, without the Linkable
+-- For better early cuttoff
+type instance RuleResult GetModIfaceWithoutLinkable = HiFileResult
+
 data FileOfInterestStatus = OnDisk | Modified
   deriving (Eq, Show, Typeable, Generic)
 instance Hashable FileOfInterestStatus
@@ -178,11 +205,11 @@ type instance RuleResult IsFileOfInterest = IsFileOfInterestResult
 
 -- | Generate a ModSummary that has enough information to be used to get .hi and .hie files.
 -- without needing to parse the entire source
-type instance RuleResult GetModSummary = ModSummary
+type instance RuleResult GetModSummary = (ModSummary,[LImportDecl GhcPs])
 
 -- | Generate a ModSummary with the timestamps elided,
 --   for more successful early cutoff
-type instance RuleResult GetModSummaryWithoutTimestamps = ModSummary
+type instance RuleResult GetModSummaryWithoutTimestamps = (ModSummary,[LImportDecl GhcPs])
 
 data GetParsedModule = GetParsedModule
     deriving (Eq, Show, Typeable, Generic)
@@ -195,6 +222,15 @@ data GetLocatedImports = GetLocatedImports
 instance Hashable GetLocatedImports
 instance NFData   GetLocatedImports
 instance Binary   GetLocatedImports
+
+-- | Does this module need to be compiled?
+type instance RuleResult NeedsCompilation = Bool
+
+data NeedsCompilation = NeedsCompilation
+    deriving (Eq, Show, Typeable, Generic)
+instance Hashable NeedsCompilation
+instance NFData   NeedsCompilation
+instance Binary   NeedsCompilation
 
 data GetDependencyInformation = GetDependencyInformation
     deriving (Eq, Show, Typeable, Generic)
@@ -244,18 +280,6 @@ instance Hashable GetBindings
 instance NFData   GetBindings
 instance Binary   GetBindings
 
-data GenerateCore = GenerateCore
-    deriving (Eq, Show, Typeable, Generic)
-instance Hashable GenerateCore
-instance NFData   GenerateCore
-instance Binary   GenerateCore
-
-data GenerateByteCode = GenerateByteCode
-   deriving (Eq, Show, Typeable, Generic)
-instance Hashable GenerateByteCode
-instance NFData   GenerateByteCode
-instance Binary   GenerateByteCode
-
 data GhcSession = GhcSession
     deriving (Eq, Show, Typeable, Generic)
 instance Hashable GhcSession
@@ -278,6 +302,12 @@ data GetModIface = GetModIface
 instance Hashable GetModIface
 instance NFData   GetModIface
 instance Binary   GetModIface
+
+data GetModIfaceWithoutLinkable = GetModIfaceWithoutLinkable
+    deriving (Eq, Show, Typeable, Generic)
+instance Hashable GetModIfaceWithoutLinkable
+instance NFData   GetModIfaceWithoutLinkable
+instance Binary   GetModIfaceWithoutLinkable
 
 data IsFileOfInterest = IsFileOfInterest
     deriving (Eq, Show, Typeable, Generic)
